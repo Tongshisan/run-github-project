@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LLM 查询分析器 - 使用大模型理解自然语言需求
-支持 OpenAI 和 Anthropic Claude
+支持多个 LLM 提供商：OpenAI、Anthropic、DeepSeek、Qwen 等
 """
 
 import os
@@ -13,29 +13,83 @@ import requests
 class LLMQueryAnalyzer:
     """使用 LLM 分析用户查询"""
     
-    def __init__(self, provider: str = "openai", api_key: Optional[str] = None):
+    # 模型配置
+    MODELS = {
+        'openai': {
+            'api_url': 'https://api.openai.com/v1/chat/completions',
+            'model': 'gpt-4o-mini',
+            'api_type': 'openai'
+        },
+        'anthropic': {
+            'api_url': 'https://api.anthropic.com/v1/messages',
+            'model': 'claude-3-5-sonnet-20241022',
+            'api_type': 'anthropic'
+        },
+        'deepseek': {
+            'api_url': 'https://api.deepseek.com/v1/chat/completions',
+            'model': 'deepseek-chat',
+            'api_type': 'openai'  # DeepSeek 兼容 OpenAI API
+        },
+        'qwen': {
+            'api_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
+            'model': 'qwen-turbo',
+            'api_type': 'openai'  # 通义千问兼容 OpenAI API
+        },
+        'glm': {
+            'api_url': 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+            'model': 'glm-4-flash',
+            'api_type': 'openai'  # 智谱 GLM 兼容 OpenAI API
+        }
+    }
+    
+    def __init__(self, provider: str = "deepseek", api_key: Optional[str] = None):
         """
         初始化 LLM 分析器
         
         Args:
-            provider: LLM 提供商 ("openai" 或 "anthropic")
+            provider: LLM 提供商 ("openai", "anthropic", "deepseek", "qwen", "glm")
             api_key: API 密钥
         """
         self.provider = provider.lower()
         
-        if self.provider == "openai":
-            self.api_key = api_key or os.getenv('OPENAI_API_KEY')
-            self.api_url = "https://api.openai.com/v1/chat/completions"
-            self.model = "gpt-4o-mini"  # 使用 mini 版本更经济
-        elif self.provider == "anthropic":
-            self.api_key = api_key or os.getenv('ANTHROPIC_API_KEY')
-            self.api_url = "https://api.anthropic.com/v1/messages"
-            self.model = "claude-3-5-sonnet-20241022"
-        else:
-            raise ValueError(f"不支持的提供商: {provider}")
+        if self.provider not in self.MODELS:
+            available = ', '.join(self.MODELS.keys())
+            raise ValueError(f"不支持的提供商: {provider}. 可用: {available}")
+        
+        # 获取配置
+        config = self.MODELS[self.provider]
+        self.api_url = config['api_url']
+        self.model = config['model']
+        self.api_type = config['api_type']
+        
+        # 获取 API key
+        self.api_key = api_key or self._get_api_key()
         
         if not self.api_key:
-            raise ValueError(f"请设置 {self.provider.upper()}_API_KEY 环境变量")
+            env_var = self._get_env_var_name()
+            raise ValueError(f"请设置 {env_var} 环境变量")
+    
+    def _get_api_key(self) -> Optional[str]:
+        """根据提供商获取 API key"""
+        env_vars = {
+            'openai': 'OPENAI_API_KEY',
+            'anthropic': 'ANTHROPIC_API_KEY',
+            'deepseek': 'DEEPSEEK_API_KEY',
+            'qwen': 'DASHSCOPE_API_KEY',  # 通义千问
+            'glm': 'GLM_API_KEY'  # 智谱
+        }
+        return os.getenv(env_vars.get(self.provider, f'{self.provider.upper()}_API_KEY'))
+    
+    def _get_env_var_name(self) -> str:
+        """获取环境变量名称"""
+        env_vars = {
+            'openai': 'OPENAI_API_KEY',
+            'anthropic': 'ANTHROPIC_API_KEY',
+            'deepseek': 'DEEPSEEK_API_KEY',
+            'qwen': 'DASHSCOPE_API_KEY',
+            'glm': 'GLM_API_KEY'
+        }
+        return env_vars.get(self.provider, f'{self.provider.upper()}_API_KEY')
     
     def analyze_query(self, user_query: str) -> Dict[str, any]:
         """
@@ -67,10 +121,14 @@ class LLMQueryAnalyzer:
         user_prompt = f"用户需求：{user_query}\n\n请分析这个需求并返回 JSON 格式的结果。"
         
         try:
-            if self.provider == "openai":
-                result = self._call_openai(system_prompt, user_prompt)
-            else:
+            if self.api_type == 'openai':
+                # OpenAI 兼容的 API (OpenAI, DeepSeek, Qwen, GLM)
+                result = self._call_openai_compatible(system_prompt, user_prompt)
+            elif self.api_type == 'anthropic':
+                # Anthropic Claude API
                 result = self._call_anthropic(system_prompt, user_prompt)
+            else:
+                raise ValueError(f"未知的 API 类型: {self.api_type}")
             
             # 解析 JSON 结果
             analysis = json.loads(result)
@@ -80,6 +138,23 @@ class LLMQueryAnalyzer:
                 analysis['keywords'] = []
             if 'count' not in analysis:
                 analysis['count'] = 10
+            
+            # 🆕 过滤禁用关键词
+            BANNED_KEYWORDS = {
+                'graduation', 'university', 'study', 'practice', 
+                'project', 'repository', 'website', 'example', 
+                'sample', 'demo', 'tutorial', 'beginner',
+                'interactive', 'awesome', 'cool', 'best', 'good',
+                'learning', 'education'
+            }
+            analysis['keywords'] = [
+                kw for kw in analysis['keywords']
+                if kw.lower() not in BANNED_KEYWORDS
+            ]
+            
+            # 🆕 限制关键词数量（最多 2 个）
+            if len(analysis['keywords']) > 2:
+                analysis['keywords'] = analysis['keywords'][:2]
             
             # 限制数量
             analysis['count'] = min(analysis['count'], 100)
@@ -95,8 +170,11 @@ class LLMQueryAnalyzer:
             # 降级到简单规则
             return self._fallback_analyze(user_query)
     
-    def _call_openai(self, system_prompt: str, user_prompt: str) -> str:
-        """调用 OpenAI API"""
+    def _call_openai_compatible(self, system_prompt: str, user_prompt: str) -> str:
+        """
+        调用 OpenAI 兼容的 API
+        适用于: OpenAI, DeepSeek, Qwen, GLM 等
+        """
         headers = {
             'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json'
@@ -108,9 +186,12 @@ class LLMQueryAnalyzer:
                 {'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': user_prompt}
             ],
-            'response_format': {'type': 'json_object'},
             'temperature': 0.3
         }
+        
+        # DeepSeek 和某些模型支持 response_format
+        if self.provider in ['openai', 'deepseek']:
+            data['response_format'] = {'type': 'json_object'}
         
         response = requests.post(self.api_url, headers=headers, json=data, timeout=30)
         response.raise_for_status()
@@ -198,23 +279,38 @@ class LLMQueryAnalyzer:
 
 # 使用示例
 if __name__ == "__main__":
-    # 测试
-    try:
-        # 尝试使用 OpenAI
-        analyzer = LLMQueryAnalyzer(provider="openai")
-        
-        test_queries = [
-            "找 10 个 CSS 动画库",
-            "推荐 Python 机器学习框架",
-            "React UI 组件库",
-        ]
-        
-        for query in test_queries:
-            print(f"\n查询: {query}")
-            result = analyzer.analyze_query(query)
-            print(f"结果: {json.dumps(result, ensure_ascii=False, indent=2)}")
+    # 测试多个模型
+    print("=" * 70)
+    print("测试 LLM 查询分析器")
+    print("=" * 70)
+    
+    test_query = "找 10 个 CSS 动画库"
+    
+    # 可选的提供商
+    providers = ['deepseek', 'openai', 'qwen', 'glm', 'anthropic']
+    
+    for provider in providers:
+        try:
+            print(f"\n尝试使用 {provider.upper()}...")
+            analyzer = LLMQueryAnalyzer(provider=provider)
+            result = analyzer.analyze_query(test_query)
             
-    except ValueError as e:
-        print(f"错误: {e}")
-        print("\n提示: 请设置 OPENAI_API_KEY 或 ANTHROPIC_API_KEY 环境变量")
+            print(f"✅ {provider.upper()} 成功!")
+            print(f"结果: {json.dumps(result, ensure_ascii=False, indent=2)}")
+            break  # 成功一个就退出
+            
+        except ValueError as e:
+            print(f"⚠️  {provider.upper()}: {e}")
+            continue
+        except Exception as e:
+            print(f"❌ {provider.upper()} 失败: {e}")
+            continue
+    else:
+        print("\n❌ 所有提供商都失败了")
+        print("\n提示: 请至少设置一个 API key:")
+        print("  - export DEEPSEEK_API_KEY=sk-...")
+        print("  - export OPENAI_API_KEY=sk-...")
+        print("  - export DASHSCOPE_API_KEY=sk-...")  # 通义千问
+        print("  - export GLM_API_KEY=...")  # 智谱
+        print("  - export ANTHROPIC_API_KEY=sk-ant-...")
 
